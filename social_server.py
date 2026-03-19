@@ -28,27 +28,27 @@ MSG_LIMIT   = 200  # máximo de msgs por conversa retornadas
 _db_lock    = threading.Lock()
 ADMIN_KEY   = os.environ.get("ADMIN_KEY", SECRET_KEY + "-admin")
 
-# ─── Stripe ───────────────────────────────────────────────────────────────────
-STRIPE_SECRET  = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+# ─── AbacatePay ───────────────────────────────────────────────────────────────
+ABACATE_TOKEN     = os.environ.get("ABACATE_TOKEN", "")   # Token da conta AbacatePay
+ABACATE_DEV_ID    = os.environ.get("ABACATE_DEV_ID", "")  # Seu devId (aparece no painel)
+PIX_EXPIRE_MIN    = int(os.environ.get("PIX_EXPIRE_MIN", "30"))  # Minutos até expirar
 
 # ─── Catálogo de itens premium ────────────────────────────────────────────────
-# price_id = Stripe Price ID (crie no dashboard.stripe.com)
-# price_brl = preço em centavos (490 = R$4,90)
+# price_brl = preço em centavos (490 = R$4,90) — sem price_id, MP usa valor direto
 PREMIUM_ITEMS = [
-  {"id":"banner_hologram",  "type":"banner", "label":"🔷 Hologram",   "price_id":"", "price_brl":490,  "preview":"linear-gradient(135deg,#001840,#003060,#001840)"},
-  {"id":"banner_glitch_ex", "type":"banner", "label":"⚡ Glitch EX",  "price_id":"", "price_brl":490,  "preview":"linear-gradient(135deg,#000820,#001040,#000820)"},
-  {"id":"banner_sakura",    "type":"banner", "label":"🌸 Sakura",      "price_id":"", "price_brl":490,  "preview":"linear-gradient(135deg,#1a0010,#2d0020,#1a0010)"},
-  {"id":"banner_thunder",   "type":"banner", "label":"⚡ Thunder God", "price_id":"", "price_brl":790,  "preview":"linear-gradient(135deg,#100800,#201000,#100800)"},
-  {"id":"banner_deep_void", "type":"banner", "label":"🌑 Deep Void",   "price_id":"", "price_brl":990,  "preview":"linear-gradient(135deg,#050005,#0a000f,#050005)"},
-  {"id":"av_crown",         "type":"avatar", "label":"👑 Crown",       "price_id":"", "price_brl":390,  "icon":"👑"},
-  {"id":"av_phoenix",       "type":"avatar", "label":"🔥 Phoenix",     "price_id":"", "price_brl":590,  "icon":"🔥"},
-  {"id":"av_lightning",     "type":"avatar", "label":"⚡ Lightning",   "price_id":"", "price_brl":390,  "icon":"⚡"},
-  {"id":"av_shadow",        "type":"avatar", "label":"🌑 Shadow Aura", "price_id":"", "price_brl":590,  "icon":"🌑"},
-  {"id":"av_diamond",       "type":"avatar", "label":"💎 Diamond",     "price_id":"", "price_brl":990,  "icon":"💎"},
-  {"id":"bundle_starter",   "type":"bundle", "label":"🎁 Starter Pack","price_id":"", "price_brl":990,  "icon":"🎁",
+  {"id":"banner_hologram",  "type":"banner", "label":"🔷 Hologram",   "price_brl":490,  "preview":"linear-gradient(135deg,#001840,#003060,#001840)"},
+  {"id":"banner_glitch_ex", "type":"banner", "label":"⚡ Glitch EX",  "price_brl":490,  "preview":"linear-gradient(135deg,#000820,#001040,#000820)"},
+  {"id":"banner_sakura",    "type":"banner", "label":"🌸 Sakura",      "price_brl":490,  "preview":"linear-gradient(135deg,#1a0010,#2d0020,#1a0010)"},
+  {"id":"banner_thunder",   "type":"banner", "label":"⚡ Thunder God", "price_brl":790,  "preview":"linear-gradient(135deg,#100800,#201000,#100800)"},
+  {"id":"banner_deep_void", "type":"banner", "label":"🌑 Deep Void",   "price_brl":990,  "preview":"linear-gradient(135deg,#050005,#0a000f,#050005)"},
+  {"id":"av_crown",         "type":"avatar", "label":"👑 Crown",       "price_brl":390,  "icon":"👑"},
+  {"id":"av_phoenix",       "type":"avatar", "label":"🔥 Phoenix",     "price_brl":590,  "icon":"🔥"},
+  {"id":"av_lightning",     "type":"avatar", "label":"⚡ Lightning",   "price_brl":390,  "icon":"⚡"},
+  {"id":"av_shadow",        "type":"avatar", "label":"🌑 Shadow Aura", "price_brl":590,  "icon":"🌑"},
+  {"id":"av_diamond",       "type":"avatar", "label":"💎 Diamond",     "price_brl":990,  "icon":"💎"},
+  {"id":"bundle_starter",   "type":"bundle", "label":"🎁 Starter Pack","price_brl":990,  "icon":"🎁",
    "includes":["banner_hologram","av_crown","av_lightning"]},
-  {"id":"bundle_elite",     "type":"bundle", "label":"💎 Elite Pack",  "price_id":"", "price_brl":1990, "icon":"💎",
+  {"id":"bundle_elite",     "type":"bundle", "label":"💎 Elite Pack",  "price_brl":1990, "icon":"💎",
    "includes":["banner_deep_void","banner_thunder","av_diamond","av_phoenix","av_shadow"]},
 ]
 _ITEMS_BY_ID = {it["id"]: it for it in PREMIUM_ITEMS}
@@ -118,19 +118,13 @@ def init_db():
         con.commit()
         con.close()
     print(f"[DB] {DB_PATH}")
-    # Load stored price_ids into memory
+    # Cria tabela config se não existir (legado)
     try:
         con = _db()
         con.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        row = con.execute("SELECT value FROM config WHERE key='price_ids'").fetchone()
-        if row:
-            price_ids = json.loads(row[0])
-            for item_id, price_id in price_ids.items():
-                if item_id in _ITEMS_BY_ID:
-                    _ITEMS_BY_ID[item_id]["price_id"] = price_id
-        con.close()
+        con.commit(); con.close()
     except Exception as e:
-        print(f"[DB] price_ids load: {e}")
+        print(f"[DB] config init: {e}")
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 def _check_sig(gmbr_id: str, sig: str) -> bool:
@@ -397,7 +391,6 @@ class Handler(BaseHTTPRequestHandler):
             for it in PREMIUM_ITEMS:
                 entry = dict(it)
                 entry["owned"] = it["id"] in owned_set
-                entry.pop("price_id", None)  # don't leak stripe price ids
                 items_out.append(entry)
             self._ok({"ok": True, "items": items_out, "owned": list(owned_set)}); return
 
@@ -674,122 +667,113 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit(); con.close()
             self._ok({"ok": True}); return
 
-        # ── Admin: update price_ids in catalog ─────────────────────────────────
+        # ── Admin: catalog-update (legado Stripe — não usado no MP) ────────────
         if p == "/api/admin/catalog-update":
             if not _check_admin(b): self._err("forbidden", 403); return
-            price_ids = b.get("price_ids", {})
-            with _db_lock:
-                con = _db()
-                # Store as a single JSON config row
-                con.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
-                con.execute("INSERT INTO config (key,value) VALUES ('price_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                            (json.dumps(price_ids),))
-                con.commit(); con.close()
-            # Update in-memory catalog
-            for item_id, price_id in price_ids.items():
-                if item_id in _ITEMS_BY_ID:
-                    _ITEMS_BY_ID[item_id]["price_id"] = price_id
-            self._ok({"ok": True}); return
+            self._ok({"ok": True, "info": "Mercado Pago não usa price_ids"}); return
 
-        # ── Stripe: create checkout session ────────────────────────────────────
+        # ── AbacatePay: gerar cobrança PIX ────────────────────────────────────
         if p == "/api/premium/checkout":
             gid     = self._auth(b)
             if not gid: self._err("auth", 401); return
-            item_id  = b.get("item_id","").strip()
-            # Accept price_id directly (sent by app.py) OR fall back to catalog
-            price_id = b.get("price_id","").strip() or _ITEMS_BY_ID.get(item_id,{}).get("price_id","").strip()
+            item_id = b.get("item_id","").strip()
             if not item_id: self._err("item_id required"); return
-            if not STRIPE_SECRET: self._err("Pagamentos não configurados — defina STRIPE_SECRET_KEY no Railway"); return
-            if not price_id: self._err("Price ID não configurado para este item. Configure no Painel Admin → Loja."); return
+            if not ABACATE_TOKEN: self._err("Pagamentos não configurados — defina ABACATE_TOKEN no Railway"); return
 
-            item = _ITEMS_BY_ID.get(item_id, {"id": item_id, "price_brl": 0})
+            item = _ITEMS_BY_ID.get(item_id)
+            if not item: self._err(f"Item '{item_id}' não existe"); return
 
-            # Create Stripe Checkout Session via API
+            amount_brl  = round(item["price_brl"] / 100, 2)  # centavos → reais
+            label       = item.get("label", item_id)
+            expire_at   = int(time.time() + PIX_EXPIRE_MIN * 60)
+
             try:
-                payload = "&".join([
-                    "mode=payment",
-                    f"line_items[0][price]={price_id}",
-                    "line_items[0][quantity]=1",
-                    f"metadata[gmbr_id]={gid}",
-                    f"metadata[item_id]={item_id}",
-                    "success_url=https://gmbrlauncher.com/payment_success",
-                    "cancel_url=https://gmbrlauncher.com/payment_cancel",
-                ])
+                payload = json.dumps({
+                    "amount":      amount_brl,
+                    "description": f"GMBR Store — {label}",
+                    "expiresAt":   expire_at,
+                    "customer": {
+                        "name":  gid,
+                        "email": f"{gid.lower()}@gmbr.internal",
+                        "taxId": "00000000000",  # CPF placeholder — AbacatePay aceita
+                    },
+                    "metadata": {
+                        "gmbr_id":  gid,
+                        "item_id":  item_id,
+                    },
+                }).encode()
+
                 req = urllib.request.Request(
-                    "https://api.stripe.com/v1/checkout/sessions",
-                    data=payload.encode(),
+                    "https://api.abacatepay.com/v1/billing/create",
+                    data=payload,
                     headers={
-                        "Authorization": f"Bearer {STRIPE_SECRET}",
-                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": f"Bearer {ABACATE_TOKEN}",
+                        "Content-Type":  "application/json",
                     },
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=15) as r:
-                    session = json.loads(r.read().decode())
+                    resp = json.loads(r.read().decode())
 
-                session_id   = session["id"]
-                checkout_url = session["url"]
+                data       = resp.get("data", resp)
+                billing_id = data.get("id", "")
+                # AbacatePay retorna pixQrCode + pixCopyPaste direto na resposta
+                pix_qr     = data.get("pixQrCode", "")
+                pix_copy   = data.get("pixCopyPaste", "")
+                # URL da tela de pagamento hospedada pelo AbacatePay (opcional)
+                checkout_url = data.get("url", "")
 
-                # Record pending purchase
                 with _db_lock:
                     con = _db(); now = time.time()
                     con.execute("""INSERT INTO purchases (gmbr_id,item_id,stripe_session,status,amount_brl,created_at)
                         VALUES (?,?,?,'pending',?,?)
                         ON CONFLICT(gmbr_id,item_id) DO UPDATE SET
                             stripe_session=excluded.stripe_session, status='pending', created_at=excluded.created_at
-                    """, (gid, item_id, session_id, item["price_brl"], now))
+                    """, (gid, item_id, billing_id, item["price_brl"], now))
                     con.commit(); con.close()
 
-                self._ok({"ok": True, "checkout_url": checkout_url, "session_id": session_id}); return
+                self._ok({
+                    "ok":          True,
+                    "session_id":  billing_id,
+                    "checkout_url": checkout_url,
+                    "pix_qr":      pix_qr,       # base64 da imagem QR
+                    "pix_copy":    pix_copy,      # copia-e-cola PIX
+                    "amount":      amount_brl,
+                    "expires_at":  expire_at,
+                    "label":       label,
+                }); return
             except Exception as e:
-                self._err(f"Stripe error: {e}"); return
+                self._err(f"AbacatePay error: {e}"); return
 
-        # ── Stripe: webhook ────────────────────────────────────────────────────
+        # ── AbacatePay: webhook de confirmação ─────────────────────────────────
         if p == "/api/premium/webhook":
-            # Read raw body for signature verification
-            n = int(self.headers.get("Content-Length", 0))
+            n   = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(n) if n else b""
-            sig_header = self.headers.get("Stripe-Signature","")
-
-            if STRIPE_WEBHOOK:
-                # Verify signature
-                try:
-                    ts_part  = [s for s in sig_header.split(",") if s.startswith("t=")]
-                    sig_part = [s for s in sig_header.split(",") if s.startswith("v1=")]
-                    if not ts_part or not sig_part:
-                        self._err("invalid signature", 400); return
-                    ts  = ts_part[0][2:]
-                    signed_payload = f"{ts}.".encode() + raw
-                    expected = hmac.new(STRIPE_WEBHOOK.encode(), signed_payload, hashlib.sha256).hexdigest()
-                    if not hmac.compare_digest(expected, sig_part[0][3:]):
-                        self._err("signature mismatch", 400); return
-                except Exception as e:
-                    self._err(f"webhook verify: {e}", 400); return
-
             try:
                 event = json.loads(raw.decode())
             except:
                 self._err("invalid json", 400); return
 
-            if event.get("type") == "checkout.session.completed":
-                sess = event["data"]["object"]
-                meta = sess.get("metadata", {})
-                gid     = meta.get("gmbr_id","").upper()
-                item_id = meta.get("item_id","")
-                session_id = sess.get("id","")
-                if gid and item_id:
+            # AbacatePay envia event = "BILLING_PAID" quando PIX é confirmado
+            ev_type   = event.get("event", "")
+            bill_data = event.get("data", {})
+            if ev_type == "BILLING_PAID":
+                meta      = bill_data.get("metadata", {})
+                gid_w     = meta.get("gmbr_id", "").upper()
+                item_id_w = meta.get("item_id", "")
+                bill_id   = bill_data.get("id", "")
+                if gid_w and item_id_w:
                     with _db_lock:
                         con = _db(); now = time.time()
                         con.execute("""UPDATE purchases SET status='paid', paid_at=?
-                            WHERE gmbr_id=? AND item_id=? AND stripe_session=?
-                        """, (now, gid, item_id, session_id))
-                        # Also insert if not found (safety)
+                            WHERE gmbr_id=? AND item_id=?
+                        """, (now, gid_w, item_id_w))
                         con.execute("""INSERT OR IGNORE INTO purchases
                             (gmbr_id,item_id,stripe_session,status,amount_brl,created_at,paid_at)
                             VALUES (?,?,?,'paid',0,?,?)
-                        """, (gid, item_id, session_id, now, now))
+                        """, (gid_w, item_id_w, bill_id, now, now))
                         con.commit(); con.close()
-                    print(f"[PREMIUM] ✓ {gid} purchased {item_id}")
+                    print(f"[PREMIUM] ✓ {gid_w} pagou {item_id_w} via PIX (billing {bill_id})")
 
             self._ok({"ok": True}); return
 
