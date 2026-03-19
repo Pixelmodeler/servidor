@@ -47,10 +47,31 @@ PREMIUM_ITEMS = [
   {"id":"av_lightning",     "type":"avatar", "label":"⚡ Lightning",   "price_brl":390,  "icon":"⚡"},
   {"id":"av_shadow",        "type":"avatar", "label":"🌑 Shadow Aura", "price_brl":590,  "icon":"🌑"},
   {"id":"av_diamond",       "type":"avatar", "label":"💎 Diamond",     "price_brl":990,  "icon":"💎"},
-  {"id":"bundle_starter",   "type":"bundle", "label":"🎁 Starter Pack","price_brl":990,  "icon":"🎁",
+  {"id":"bundle_starter",    "type":"bundle", "label":"🎁 Starter Pack",  "price_brl":990,  "icon":"🎁",
    "includes":["banner_hologram","av_crown","av_lightning"]},
-  {"id":"bundle_elite",     "type":"bundle", "label":"💎 Elite Pack",  "price_brl":1990, "icon":"💎",
+  {"id":"bundle_elite",      "type":"bundle", "label":"💎 Elite Pack",    "price_brl":1990, "icon":"💎",
    "includes":["banner_deep_void","banner_thunder","av_diamond","av_phoenix","av_shadow"]},
+  {"id":"bundle_nature",     "type":"bundle", "label":"🌿 Nature Pack",   "price_brl":790,  "icon":"🌿",
+   "includes":["banner_sakura","banner_arctic","av_ghost"]},
+  {"id":"bundle_hacker",     "type":"bundle", "label":"💻 Hacker Pack",   "price_brl":990,  "icon":"💻",
+   "includes":["banner_glitch_ex","banner_matrix","av_cyber"]},
+  # ── Banners extras ──
+  {"id":"banner_crimson",    "type":"banner", "label":"🔴 Crimson Lava",  "price_brl":490,
+   "preview":"linear-gradient(135deg,#1a0300,#3d0800,#1a0200)"},
+  {"id":"banner_ocean_depth","type":"banner", "label":"🌊 Ocean Depth",   "price_brl":490,
+   "preview":"linear-gradient(180deg,#010e18,#001f3a,#010e18)"},
+  {"id":"banner_matrix",     "type":"banner", "label":"☢ Matrix",          "price_brl":590,
+   "preview":"linear-gradient(135deg,#010a01,#001600,#010a01)"},
+  {"id":"banner_galaxy",     "type":"banner", "label":"🌌 Galaxy",          "price_brl":590,
+   "preview":"linear-gradient(135deg,#020010,#0a0028,#020010)"},
+  {"id":"banner_arctic",     "type":"banner", "label":"🧊 Arctic Storm",   "price_brl":490,
+   "preview":"linear-gradient(135deg,#010c18,#002438,#010c18)"},
+  {"id":"banner_sunset",     "type":"banner", "label":"🌅 Sunset",          "price_brl":490,
+   "preview":"linear-gradient(180deg,#080012,#2d0a00,#080012)"},
+  # ── Avatar Effects extras ──
+  {"id":"av_ghost",          "type":"avatar", "label":"👻 Ghost",          "price_brl":390,  "icon":"👻"},
+  {"id":"av_cyber",          "type":"avatar", "label":"🤖 Cyber Core",     "price_brl":490,  "icon":"🤖"},
+  {"id":"av_blood_moon",     "type":"avatar", "label":"🌕 Blood Moon",     "price_brl":590,  "icon":"🌕"},
 ]
 _ITEMS_BY_ID = {it["id"]: it for it in PREMIUM_ITEMS}
 
