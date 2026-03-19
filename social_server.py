@@ -695,14 +695,14 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/premium/checkout":
             gid     = self._auth(b)
             if not gid: self._err("auth", 401); return
-            item_id = b.get("item_id","").strip()
-            item    = _ITEMS_BY_ID.get(item_id)
-            if not item: self._err(f"Item '{item_id}' não encontrado"); return
-            if not STRIPE_SECRET: self._err("Pagamentos não configurados no servidor"); return
+            item_id  = b.get("item_id","").strip()
+            # Accept price_id directly (sent by app.py) OR fall back to catalog
+            price_id = b.get("price_id","").strip() or _ITEMS_BY_ID.get(item_id,{}).get("price_id","").strip()
+            if not item_id: self._err("item_id required"); return
+            if not STRIPE_SECRET: self._err("Pagamentos não configurados — defina STRIPE_SECRET_KEY no Railway"); return
+            if not price_id: self._err("Price ID não configurado para este item. Configure no Painel Admin → Loja."); return
 
-            price_id = item.get("price_id","").strip()
-            if not price_id:
-                self._err("Este item ainda não tem preço configurado no servidor"); return
+            item = _ITEMS_BY_ID.get(item_id, {"id": item_id, "price_brl": 0})
 
             # Create Stripe Checkout Session via API
             try:
@@ -712,8 +712,8 @@ class Handler(BaseHTTPRequestHandler):
                     "line_items[0][quantity]=1",
                     f"metadata[gmbr_id]={gid}",
                     f"metadata[item_id]={item_id}",
-                    "success_url=gmbrlauncher://payment_success",
-                    "cancel_url=gmbrlauncher://payment_cancel",
+                    "success_url=https://gmbrlauncher.com/payment_success",
+                    "cancel_url=https://gmbrlauncher.com/payment_cancel",
                 ])
                 req = urllib.request.Request(
                     "https://api.stripe.com/v1/checkout/sessions",
@@ -727,7 +727,7 @@ class Handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req, timeout=15) as r:
                     session = json.loads(r.read().decode())
 
-                session_id = session["id"]
+                session_id   = session["id"]
                 checkout_url = session["url"]
 
                 # Record pending purchase
