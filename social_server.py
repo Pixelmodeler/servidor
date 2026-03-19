@@ -27,6 +27,31 @@ ONLINE_TTL  = 90   # segundos até marcar offline
 MSG_LIMIT   = 200  # máximo de msgs por conversa retornadas
 _db_lock    = threading.Lock()
 ADMIN_KEY   = os.environ.get("ADMIN_KEY", SECRET_KEY + "-admin")
+
+# ─── Stripe ───────────────────────────────────────────────────────────────────
+STRIPE_SECRET  = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+# ─── Catálogo de itens premium ────────────────────────────────────────────────
+# price_id = Stripe Price ID (crie no dashboard.stripe.com)
+# price_brl = preço em centavos (490 = R$4,90)
+PREMIUM_ITEMS = [
+  {"id":"banner_hologram",  "type":"banner", "label":"🔷 Hologram",   "price_id":"", "price_brl":490,  "preview":"linear-gradient(135deg,#001840,#003060,#001840)"},
+  {"id":"banner_glitch_ex", "type":"banner", "label":"⚡ Glitch EX",  "price_id":"", "price_brl":490,  "preview":"linear-gradient(135deg,#000820,#001040,#000820)"},
+  {"id":"banner_sakura",    "type":"banner", "label":"🌸 Sakura",      "price_id":"", "price_brl":490,  "preview":"linear-gradient(135deg,#1a0010,#2d0020,#1a0010)"},
+  {"id":"banner_thunder",   "type":"banner", "label":"⚡ Thunder God", "price_id":"", "price_brl":790,  "preview":"linear-gradient(135deg,#100800,#201000,#100800)"},
+  {"id":"banner_deep_void", "type":"banner", "label":"🌑 Deep Void",   "price_id":"", "price_brl":990,  "preview":"linear-gradient(135deg,#050005,#0a000f,#050005)"},
+  {"id":"av_crown",         "type":"avatar", "label":"👑 Crown",       "price_id":"", "price_brl":390,  "icon":"👑"},
+  {"id":"av_phoenix",       "type":"avatar", "label":"🔥 Phoenix",     "price_id":"", "price_brl":590,  "icon":"🔥"},
+  {"id":"av_lightning",     "type":"avatar", "label":"⚡ Lightning",   "price_id":"", "price_brl":390,  "icon":"⚡"},
+  {"id":"av_shadow",        "type":"avatar", "label":"🌑 Shadow Aura", "price_id":"", "price_brl":590,  "icon":"🌑"},
+  {"id":"av_diamond",       "type":"avatar", "label":"💎 Diamond",     "price_id":"", "price_brl":990,  "icon":"💎"},
+  {"id":"bundle_starter",   "type":"bundle", "label":"🎁 Starter Pack","price_id":"", "price_brl":990,  "icon":"🎁",
+   "includes":["banner_hologram","av_crown","av_lightning"]},
+  {"id":"bundle_elite",     "type":"bundle", "label":"💎 Elite Pack",  "price_id":"", "price_brl":1990, "icon":"💎",
+   "includes":["banner_deep_void","banner_thunder","av_diamond","av_phoenix","av_shadow"]},
+]
+_ITEMS_BY_ID = {it["id"]: it for it in PREMIUM_ITEMS}
 # ─── DB ──────────────────────────────────────────────────────────────────────
 def _db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -76,6 +101,19 @@ def init_db():
             created_at REAL DEFAULT 0,
             PRIMARY KEY (gmbr_id, type)
         );
+        CREATE TABLE IF NOT EXISTS purchases (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            gmbr_id        TEXT NOT NULL,
+            item_id        TEXT NOT NULL,
+            stripe_session TEXT DEFAULT '',
+            status         TEXT DEFAULT 'pending',
+            amount_brl     INTEGER DEFAULT 0,
+            created_at     REAL DEFAULT 0,
+            paid_at        REAL DEFAULT 0,
+            UNIQUE(gmbr_id, item_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_purchases_gmbr     ON purchases(gmbr_id);
+        CREATE INDEX IF NOT EXISTS idx_purchases_session  ON purchases(stripe_session);
         """)
         con.commit()
         con.close()
@@ -324,6 +362,51 @@ class Handler(BaseHTTPRequestHandler):
                 users_out.append(u)
             self._ok({"ok": True, "users": users_out}); return
 
+        # ── Premium: catalog ──────────────────────────────────────────────────
+        if p == "/api/premium/catalog":
+            gid = q.get("gmbr_id","").upper()
+            sig = q.get("sig","")
+            owned = []
+            if gid and _check_sig(gid, sig):
+                with _db_lock:
+                    con = _db(); cur = con.cursor()
+                    rows = cur.execute(
+                        "SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'", (gid,)).fetchall()
+                    con.close()
+                owned = [r["item_id"] for r in rows]
+            # Expand bundle ownership
+            owned_set = set(owned)
+            for iid in list(owned_set):
+                it = _ITEMS_BY_ID.get(iid,{})
+                if it.get("type") == "bundle":
+                    owned_set.update(it.get("includes",[]))
+            items_out = []
+            for it in PREMIUM_ITEMS:
+                entry = dict(it)
+                entry["owned"] = it["id"] in owned_set
+                entry.pop("price_id", None)  # don't leak stripe price ids
+                items_out.append(entry)
+            self._ok({"ok": True, "items": items_out, "owned": list(owned_set)}); return
+
+        # ── Premium: my items ─────────────────────────────────────────────────
+        if p == "/api/premium/my-items":
+            gid = q.get("gmbr_id","").upper()
+            sig = q.get("sig","")
+            if not gid or not _check_sig(gid, sig):
+                self._err("auth", 401); return
+            with _db_lock:
+                con = _db(); cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'", (gid,)).fetchall()
+                con.close()
+            owned = set(r["item_id"] for r in rows)
+            # Expand bundles
+            for iid in list(owned):
+                it = _ITEMS_BY_ID.get(iid,{})
+                if it.get("type") == "bundle":
+                    owned.update(it.get("includes",[]))
+            self._ok({"ok": True, "owned": list(owned)}); return
+
         self._err("Not found", 404)
 
     def do_POST(self):
@@ -550,6 +633,151 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute("UPDATE users SET last_seen=0 WHERE gmbr_id=?", (gid,))
                 con.commit(); con.close()
             self._ok({"ok": True}); return
+
+        # ── Admin: grant item manually (sem pagamento) ─────────────────────────
+        if p == "/api/admin/premium/grant":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            gid     = b.get("gmbr_id","").strip().upper()
+            item_id = b.get("item_id","").strip()
+            if not gid or not item_id: self._err("gmbr_id + item_id required"); return
+            if item_id not in _ITEMS_BY_ID: self._err(f"Item '{item_id}' não existe"); return
+            with _db_lock:
+                con = _db(); now = time.time()
+                con.execute("""INSERT INTO purchases (gmbr_id,item_id,stripe_session,status,amount_brl,created_at,paid_at)
+                    VALUES (?,?,'admin','paid',0,?,?)
+                    ON CONFLICT(gmbr_id,item_id) DO UPDATE SET status='paid', paid_at=excluded.paid_at
+                """, (gid, item_id, now, now))
+                con.commit(); con.close()
+            self._ok({"ok": True, "granted": item_id, "to": gid}); return
+
+        # ── Admin: revoke item ─────────────────────────────────────────────────
+        if p == "/api/admin/premium/revoke":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            gid     = b.get("gmbr_id","").strip().upper()
+            item_id = b.get("item_id","").strip()
+            with _db_lock:
+                con = _db()
+                con.execute("DELETE FROM purchases WHERE gmbr_id=? AND item_id=?", (gid, item_id))
+                con.commit(); con.close()
+            self._ok({"ok": True}); return
+
+        # ── Stripe: create checkout session ────────────────────────────────────
+        if p == "/api/premium/checkout":
+            gid     = self._auth(b)
+            if not gid: self._err("auth", 401); return
+            item_id = b.get("item_id","").strip()
+            item    = _ITEMS_BY_ID.get(item_id)
+            if not item: self._err(f"Item '{item_id}' não encontrado"); return
+            if not STRIPE_SECRET: self._err("Pagamentos não configurados no servidor"); return
+
+            price_id = item.get("price_id","").strip()
+            if not price_id:
+                self._err("Este item ainda não tem preço configurado no servidor"); return
+
+            # Create Stripe Checkout Session via API
+            try:
+                payload = "&".join([
+                    "mode=payment",
+                    f"line_items[0][price]={price_id}",
+                    "line_items[0][quantity]=1",
+                    f"metadata[gmbr_id]={gid}",
+                    f"metadata[item_id]={item_id}",
+                    "success_url=gmbrlauncher://payment_success",
+                    "cancel_url=gmbrlauncher://payment_cancel",
+                ])
+                req = urllib.request.Request(
+                    "https://api.stripe.com/v1/checkout/sessions",
+                    data=payload.encode(),
+                    headers={
+                        "Authorization": f"Bearer {STRIPE_SECRET}",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    session = json.loads(r.read().decode())
+
+                session_id = session["id"]
+                checkout_url = session["url"]
+
+                # Record pending purchase
+                with _db_lock:
+                    con = _db(); now = time.time()
+                    con.execute("""INSERT INTO purchases (gmbr_id,item_id,stripe_session,status,amount_brl,created_at)
+                        VALUES (?,?,?,'pending',?,?)
+                        ON CONFLICT(gmbr_id,item_id) DO UPDATE SET
+                            stripe_session=excluded.stripe_session, status='pending', created_at=excluded.created_at
+                    """, (gid, item_id, session_id, item["price_brl"], now))
+                    con.commit(); con.close()
+
+                self._ok({"ok": True, "checkout_url": checkout_url, "session_id": session_id}); return
+            except Exception as e:
+                self._err(f"Stripe error: {e}"); return
+
+        # ── Stripe: webhook ────────────────────────────────────────────────────
+        if p == "/api/premium/webhook":
+            # Read raw body for signature verification
+            n = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(n) if n else b""
+            sig_header = self.headers.get("Stripe-Signature","")
+
+            if STRIPE_WEBHOOK:
+                # Verify signature
+                try:
+                    ts_part  = [s for s in sig_header.split(",") if s.startswith("t=")]
+                    sig_part = [s for s in sig_header.split(",") if s.startswith("v1=")]
+                    if not ts_part or not sig_part:
+                        self._err("invalid signature", 400); return
+                    ts  = ts_part[0][2:]
+                    signed_payload = f"{ts}.".encode() + raw
+                    expected = hmac.new(STRIPE_WEBHOOK.encode(), signed_payload, hashlib.sha256).hexdigest()
+                    if not hmac.compare_digest(expected, sig_part[0][3:]):
+                        self._err("signature mismatch", 400); return
+                except Exception as e:
+                    self._err(f"webhook verify: {e}", 400); return
+
+            try:
+                event = json.loads(raw.decode())
+            except:
+                self._err("invalid json", 400); return
+
+            if event.get("type") == "checkout.session.completed":
+                sess = event["data"]["object"]
+                meta = sess.get("metadata", {})
+                gid     = meta.get("gmbr_id","").upper()
+                item_id = meta.get("item_id","")
+                session_id = sess.get("id","")
+                if gid and item_id:
+                    with _db_lock:
+                        con = _db(); now = time.time()
+                        con.execute("""UPDATE purchases SET status='paid', paid_at=?
+                            WHERE gmbr_id=? AND item_id=? AND stripe_session=?
+                        """, (now, gid, item_id, session_id))
+                        # Also insert if not found (safety)
+                        con.execute("""INSERT OR IGNORE INTO purchases
+                            (gmbr_id,item_id,stripe_session,status,amount_brl,created_at,paid_at)
+                            VALUES (?,?,?,'paid',0,?,?)
+                        """, (gid, item_id, session_id, now, now))
+                        con.commit(); con.close()
+                    print(f"[PREMIUM] ✓ {gid} purchased {item_id}")
+
+            self._ok({"ok": True}); return
+
+        # ── Premium: check session status (polling from launcher) ──────────────
+        if p == "/api/premium/check-session":
+            gid        = self._auth(b)
+            if not gid: self._err("auth", 401); return
+            session_id = b.get("session_id","").strip()
+            if not session_id: self._err("session_id required"); return
+            with _db_lock:
+                con = _db(); cur = con.cursor()
+                row = cur.execute(
+                    "SELECT * FROM purchases WHERE stripe_session=? AND gmbr_id=?",
+                    (session_id, gid)).fetchone()
+                con.close()
+            if not row:
+                self._ok({"ok": True, "status": "not_found"}); return
+            self._ok({"ok": True, "status": row["status"], "item_id": row["item_id"]}); return
 
         self._err("Not found", 404)
 
