@@ -118,6 +118,19 @@ def init_db():
         con.commit()
         con.close()
     print(f"[DB] {DB_PATH}")
+    # Load stored price_ids into memory
+    try:
+        con = _db()
+        con.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        row = con.execute("SELECT value FROM config WHERE key='price_ids'").fetchone()
+        if row:
+            price_ids = json.loads(row[0])
+            for item_id, price_id in price_ids.items():
+                if item_id in _ITEMS_BY_ID:
+                    _ITEMS_BY_ID[item_id]["price_id"] = price_id
+        con.close()
+    except Exception as e:
+        print(f"[DB] price_ids load: {e}")
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 def _check_sig(gmbr_id: str, sig: str) -> bool:
@@ -659,6 +672,23 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db()
                 con.execute("DELETE FROM purchases WHERE gmbr_id=? AND item_id=?", (gid, item_id))
                 con.commit(); con.close()
+            self._ok({"ok": True}); return
+
+        # ── Admin: update price_ids in catalog ─────────────────────────────────
+        if p == "/api/admin/catalog-update":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            price_ids = b.get("price_ids", {})
+            with _db_lock:
+                con = _db()
+                # Store as a single JSON config row
+                con.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
+                con.execute("INSERT INTO config (key,value) VALUES ('price_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (json.dumps(price_ids),))
+                con.commit(); con.close()
+            # Update in-memory catalog
+            for item_id, price_id in price_ids.items():
+                if item_id in _ITEMS_BY_ID:
+                    _ITEMS_BY_ID[item_id]["price_id"] = price_id
             self._ok({"ok": True}); return
 
         # ── Stripe: create checkout session ────────────────────────────────────
