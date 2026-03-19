@@ -28,13 +28,14 @@ MSG_LIMIT   = 200  # máximo de msgs por conversa retornadas
 _db_lock    = threading.Lock()
 ADMIN_KEY   = os.environ.get("ADMIN_KEY", SECRET_KEY + "-admin")
 
-# ─── AbacatePay ───────────────────────────────────────────────────────────────
-ABACATE_TOKEN     = os.environ.get("ABACATE_TOKEN", "")   # Token da conta AbacatePay
-ABACATE_DEV_ID    = os.environ.get("ABACATE_DEV_ID", "")  # Seu devId (aparece no painel)
-PIX_EXPIRE_MIN    = int(os.environ.get("PIX_EXPIRE_MIN", "30"))  # Minutos até expirar
+# ─── PIX Manual ───────────────────────────────────────────────────────────────
+PIX_KEY       = os.environ.get("PIX_KEY", "")          # Chave PIX
+PIX_KEY_TYPE  = os.environ.get("PIX_KEY_TYPE", "email") # email|cpf|telefone|aleatoria
+PIX_NAME      = os.environ.get("PIX_NAME", "GMBR Store") # Nome no PIX
+PIX_EXPIRE_MIN = int(os.environ.get("PIX_EXPIRE_MIN", "60"))
 
 # ─── Catálogo de itens premium ────────────────────────────────────────────────
-# price_brl = preço em centavos (490 = R$4,90) — sem price_id, MP usa valor direto
+# price_brl = preço em centavos (490 = R$4,90)
 PREMIUM_ITEMS = [
   {"id":"banner_hologram",  "type":"banner", "label":"🔷 Hologram",   "price_brl":490,  "preview":"linear-gradient(135deg,#001840,#003060,#001840)"},
   {"id":"banner_glitch_ex", "type":"banner", "label":"⚡ Glitch EX",  "price_brl":490,  "preview":"linear-gradient(135deg,#000820,#001040,#000820)"},
@@ -54,38 +55,40 @@ PREMIUM_ITEMS = [
 _ITEMS_BY_ID = {it["id"]: it for it in PREMIUM_ITEMS}
 
 def _get_store_items(con=None):
-    """Carrega itens da loja do banco. Retorna lista ordenada."""
     close = False
-    if con is None:
-        con = _db(); close = True
-    rows = con.execute("SELECT * FROM store_items WHERE active=1 ORDER BY sort_order ASC, id ASC").fetchall()
+    if con is None: con = _db(); close = True
+    rows = con.execute("SELECT * FROM store_items WHERE active=1 ORDER BY sort_order,id").fetchall()
     if close: con.close()
-    items = []
-    for r in rows:
-        it = {
-            "id":        r["id"],
-            "type":      r["type"],
-            "label":     r["label"],
-            "icon":      r["icon"],
-            "price_brl": r["price_brl"],
-            "preview":   r["preview"],
-            "includes":  json.loads(r["includes"] or "[]"),
-        }
-        items.append(it)
-    return items
+    return [{"id":r["id"],"type":r["type"],"label":r["label"],"icon":r["icon"],
+             "price_brl":r["price_brl"],"preview":r["preview"],
+             "includes":json.loads(r["includes"] or "[]")} for r in rows]
 
-def _get_item_by_id(item_id: str, con=None):
+def _get_item_by_id(item_id, con=None):
     close = False
-    if con is None:
-        con = _db(); close = True
-    row = con.execute("SELECT * FROM store_items WHERE id=? AND active=1", (item_id,)).fetchone()
+    if con is None: con = _db(); close = True
+    row = con.execute("SELECT * FROM store_items WHERE id=? AND active=1",(item_id,)).fetchone()
     if close: con.close()
     if not row: return None
-    return {
-        "id": row["id"], "type": row["type"], "label": row["label"],
-        "icon": row["icon"], "price_brl": row["price_brl"],
-        "preview": row["preview"], "includes": json.loads(row["includes"] or "[]"),
-    }
+    return {"id":row["id"],"type":row["type"],"label":row["label"],"icon":row["icon"],
+            "price_brl":row["price_brl"],"preview":row["preview"],
+            "includes":json.loads(row["includes"] or "[]")}
+
+def _pix_brcode(pix_key, pix_name, amount_brl, order_id):
+    """Gera BR Code PIX (EMV/QR) para pagamento."""
+    def tlv(tag, value): return f"{tag:02d}{len(value):02d}{value}"
+    def crc16(data):
+        crc = 0xFFFF
+        for b in data.encode():
+            crc ^= b << 8
+            for _ in range(8): crc = (crc<<1)^0x1021 if crc&0x8000 else crc<<1
+        return crc & 0xFFFF
+    ma = tlv(0,"BR.GOV.BCB.PIX") + tlv(1, pix_key)
+    info = f"GMBR-{order_id}"[:25]
+    base = (tlv(0,"01") + tlv(26,ma) + tlv(52,"0000") + tlv(53,"986") +
+            tlv(54,f"{amount_brl:.2f}") + tlv(58,"BR") +
+            tlv(59,pix_name[:25]) + tlv(60,"SAO PAULO") +
+            tlv(62,tlv(5,info)) + "6304")
+    return base + f"{crc16(base):04X}"
 # ─── DB ──────────────────────────────────────────────────────────────────────
 def _db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -148,6 +151,10 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_purchases_gmbr     ON purchases(gmbr_id);
         CREATE INDEX IF NOT EXISTS idx_purchases_session  ON purchases(stripe_session);
+        CREATE TABLE IF NOT EXISTS pix_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS store_items (
             id         TEXT PRIMARY KEY,
             type       TEXT NOT NULL DEFAULT 'banner',
@@ -163,14 +170,7 @@ def init_db():
         con.commit()
         con.close()
     print(f"[DB] {DB_PATH}")
-    # Cria tabela config se não existir (legado)
-    try:
-        con = _db()
-        con.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        con.commit(); con.close()
-    except Exception as e:
-        print(f"[DB] config init: {e}")
-    # Seed store_items a partir de PREMIUM_ITEMS se ainda estiver vazio
+    # Seed store_items se vazio
     try:
         con = _db()
         count = con.execute("SELECT COUNT(*) FROM store_items").fetchone()[0]
@@ -179,7 +179,7 @@ def init_db():
                 con.execute("""INSERT OR IGNORE INTO store_items
                     (id,type,label,icon,price_brl,preview,includes,sort_order,active)
                     VALUES (?,?,?,?,?,?,?,?,1)""", (
-                    it["id"], it["type"], it["label"],
+                    it["id"], it.get("type","banner"), it.get("label",it["id"]),
                     it.get("icon","🎁"), it["price_brl"],
                     it.get("preview",""), json.dumps(it.get("includes",[])), i
                 ))
@@ -440,23 +440,16 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db(); cur = con.cursor()
                 if gid and _check_sig(gid, sig):
-                    rows = cur.execute(
-                        "SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'", (gid,)).fetchall()
+                    rows = cur.execute("SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'",(gid,)).fetchall()
                     owned = [r["item_id"] for r in rows]
                 items_db = _get_store_items(con)
                 con.close()
-            # Expand bundle ownership
             owned_set = set(owned)
             for iid in list(owned_set):
-                it = next((x for x in items_db if x["id"]==iid), {})
-                if it.get("type") == "bundle":
-                    owned_set.update(it.get("includes",[]))
-            items_out = []
-            for it in items_db:
-                entry = dict(it)
-                entry["owned"] = it["id"] in owned_set
-                items_out.append(entry)
-            self._ok({"ok": True, "items": items_out, "owned": list(owned_set)}); return
+                it = next((x for x in items_db if x["id"]==iid),{})
+                if it.get("type")=="bundle": owned_set.update(it.get("includes",[]))
+            items_out = [dict(it, owned=it["id"] in owned_set) for it in items_db]
+            self._ok({"ok":True,"items":items_out,"owned":list(owned_set)}); return
 
         # ── Premium: my items ─────────────────────────────────────────────────
         if p == "/api/premium/my-items":
@@ -476,23 +469,6 @@ class Handler(BaseHTTPRequestHandler):
                 if it.get("type") == "bundle":
                     owned.update(it.get("includes",[]))
             self._ok({"ok": True, "owned": list(owned)}); return
-
-        # ── Admin: listar itens (GET) ─────────────────────────────────────────
-        if p == "/api/admin/store/items":
-            if not _check_admin(q): self._err("forbidden", 403); return
-            with _db_lock:
-                con = _db()
-                rows = con.execute("SELECT * FROM store_items ORDER BY sort_order ASC, id ASC").fetchall()
-                con.close()
-            items = []
-            for r in rows:
-                items.append({
-                    "id": r["id"], "type": r["type"], "label": r["label"],
-                    "icon": r["icon"], "price_brl": r["price_brl"],
-                    "preview": r["preview"], "includes": json.loads(r["includes"] or "[]"),
-                    "sort_order": r["sort_order"], "active": bool(r["active"]),
-                })
-            self._ok({"ok": True, "items": items}); return
 
         self._err("Not found", 404)
 
@@ -748,115 +724,189 @@ class Handler(BaseHTTPRequestHandler):
                 con.commit(); con.close()
             self._ok({"ok": True}); return
 
-        # ── Admin: catalog-update (legado Stripe — não usado no MP) ────────────
+        # ── Admin: update price_ids in catalog ─────────────────────────────────
         if p == "/api/admin/catalog-update":
             if not _check_admin(b): self._err("forbidden", 403); return
-            self._ok({"ok": True, "info": "Mercado Pago não usa price_ids"}); return
+            price_ids = b.get("price_ids", {})
+            with _db_lock:
+                con = _db()
+                # Store as a single JSON config row
+                con.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
+                con.execute("INSERT INTO config (key,value) VALUES ('price_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (json.dumps(price_ids),))
+                con.commit(); con.close()
+            # Update in-memory catalog
+            for item_id, price_id in price_ids.items():
+                if item_id in _ITEMS_BY_ID:
+                    _ITEMS_BY_ID[item_id]["price_id"] = price_id
+            self._ok({"ok": True}); return
 
-        # ── AbacatePay: gerar cobrança PIX ────────────────────────────────────
+        # ── PIX Manual: gerar pedido ──────────────────────────────────────────
         if p == "/api/premium/checkout":
             gid     = self._auth(b)
             if not gid: self._err("auth", 401); return
             item_id = b.get("item_id","").strip()
             if not item_id: self._err("item_id required"); return
-            if not ABACATE_TOKEN: self._err("Pagamentos não configurados — defina ABACATE_TOKEN no Railway"); return
-
             item = _get_item_by_id(item_id)
             if not item: self._err(f"Item '{item_id}' não existe"); return
-
-            amount_brl  = round(item["price_brl"] / 100, 2)  # centavos → reais
-            label       = item.get("label", item_id)
-            expire_at   = int(time.time() + PIX_EXPIRE_MIN * 60)
-
+            with _db_lock:
+                con = _db()
+                def _cfg(k):
+                    r = con.execute("SELECT value FROM pix_config WHERE key=?",(k,)).fetchone()
+                    return r["value"] if r else ""
+                pix_key  = _cfg("pix_key")  or PIX_KEY
+                pix_name = _cfg("pix_name") or PIX_NAME
+                con.close()
+            if not pix_key: self._err("PIX não configurado. Configure no Painel Admin → Loja."); return
+            amount_brl = round(item["price_brl"]/100, 2)
+            label      = item.get("label", item_id)
+            now        = time.time()
+            expire_at  = int(now + PIX_EXPIRE_MIN*60)
+            import hashlib as _hs
+            order_id   = _hs.md5(f"{gid}{item_id}{int(now)}".encode()).hexdigest()[:12].upper()
+            pix_copy   = _pix_brcode(pix_key, pix_name, amount_brl, order_id)
+            pix_qr_b64 = ""
             try:
-                payload = json.dumps({
-                    "amount":      amount_brl,
-                    "description": f"GMBR Store — {label}",
-                    "expiresAt":   expire_at,
-                    "customer": {
-                        "name":  gid,
-                        "email": f"{gid.lower()}@gmbr.internal",
-                        "taxId": "00000000000",  # CPF placeholder — AbacatePay aceita
-                    },
-                    "metadata": {
-                        "gmbr_id":  gid,
-                        "item_id":  item_id,
-                    },
-                }).encode()
+                import qrcode, io, base64 as _b64
+                qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=4, border=2)
+                qr.add_data(pix_copy); qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                buf = io.BytesIO(); img.save(buf, format="PNG")
+                pix_qr_b64 = _b64.b64encode(buf.getvalue()).decode()
+            except: pass
+            with _db_lock:
+                con = _db(); 
+                con.execute("""INSERT INTO purchases (gmbr_id,item_id,stripe_session,status,amount_brl,created_at)
+                    VALUES (?,?,?,'pending',?,?)
+                    ON CONFLICT(gmbr_id,item_id) DO UPDATE SET
+                        stripe_session=excluded.stripe_session,status='pending',created_at=excluded.created_at
+                """, (gid, item_id, order_id, item["price_brl"], now))
+                con.commit(); con.close()
+            print(f"[PIX] Pedido {order_id} — {gid} → {item_id} R${amount_brl:.2f}")
+            self._ok({"ok":True,"session_id":order_id,"pix_copy":pix_copy,"pix_qr":pix_qr_b64,
+                      "pix_key":pix_key,"pix_name":pix_name,"amount":amount_brl,
+                      "expires_at":expire_at,"label":label,"order_id":order_id}); return
 
-                req = urllib.request.Request(
-                    "https://api.abacatepay.com/v1/billing/create",
-                    data=payload,
-                    headers={
-                        "Authorization": f"Bearer {ABACATE_TOKEN}",
-                        "Content-Type":  "application/json",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    resp = json.loads(r.read().decode())
-
-                data       = resp.get("data", resp)
-                billing_id = data.get("id", "")
-                # AbacatePay retorna pixQrCode + pixCopyPaste direto na resposta
-                pix_qr     = data.get("pixQrCode", "")
-                pix_copy   = data.get("pixCopyPaste", "")
-                # URL da tela de pagamento hospedada pelo AbacatePay (opcional)
-                checkout_url = data.get("url", "")
-
-                with _db_lock:
-                    con = _db(); now = time.time()
-                    con.execute("""INSERT INTO purchases (gmbr_id,item_id,stripe_session,status,amount_brl,created_at)
-                        VALUES (?,?,?,'pending',?,?)
-                        ON CONFLICT(gmbr_id,item_id) DO UPDATE SET
-                            stripe_session=excluded.stripe_session, status='pending', created_at=excluded.created_at
-                    """, (gid, item_id, billing_id, item["price_brl"], now))
-                    con.commit(); con.close()
-
-                self._ok({
-                    "ok":          True,
-                    "session_id":  billing_id,
-                    "checkout_url": checkout_url,
-                    "pix_qr":      pix_qr,       # base64 da imagem QR
-                    "pix_copy":    pix_copy,      # copia-e-cola PIX
-                    "amount":      amount_brl,
-                    "expires_at":  expire_at,
-                    "label":       label,
-                }); return
-            except Exception as e:
-                self._err(f"AbacatePay error: {e}"); return
-
-        # ── AbacatePay: webhook de confirmação ─────────────────────────────────
+        # ── PIX Manual: webhook placeholder ───────────────────────────────────
         if p == "/api/premium/webhook":
-            n   = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(n) if n else b""
-            try:
-                event = json.loads(raw.decode())
-            except:
-                self._err("invalid json", 400); return
-
-            # AbacatePay envia event = "BILLING_PAID" quando PIX é confirmado
-            ev_type   = event.get("event", "")
-            bill_data = event.get("data", {})
-            if ev_type == "BILLING_PAID":
-                meta      = bill_data.get("metadata", {})
-                gid_w     = meta.get("gmbr_id", "").upper()
-                item_id_w = meta.get("item_id", "")
-                bill_id   = bill_data.get("id", "")
-                if gid_w and item_id_w:
-                    with _db_lock:
-                        con = _db(); now = time.time()
-                        con.execute("""UPDATE purchases SET status='paid', paid_at=?
-                            WHERE gmbr_id=? AND item_id=?
-                        """, (now, gid_w, item_id_w))
-                        con.execute("""INSERT OR IGNORE INTO purchases
-                            (gmbr_id,item_id,stripe_session,status,amount_brl,created_at,paid_at)
-                            VALUES (?,?,?,'paid',0,?,?)
-                        """, (gid_w, item_id_w, bill_id, now, now))
-                        con.commit(); con.close()
-                    print(f"[PREMIUM] ✓ {gid_w} pagou {item_id_w} via PIX (billing {bill_id})")
-
             self._ok({"ok": True}); return
+
+        # ── Admin: pedidos pendentes ───────────────────────────────────────────
+        if p == "/api/admin/store/pending":
+            if not _check_admin(b): self._err("forbidden",403); return
+            with _db_lock:
+                con = _db(); cur = con.cursor()
+                rows = cur.execute("""SELECT p.*,u.display_name,u.name as uname FROM purchases p
+                    LEFT JOIN users u ON u.gmbr_id=p.gmbr_id
+                    WHERE p.status='pending' ORDER BY p.created_at DESC LIMIT 100""").fetchall()
+                con.close()
+            pending = [{"id":r["id"],"gmbr_id":r["gmbr_id"],
+                "name":r["display_name"] or r["uname"] or r["gmbr_id"],
+                "item_id":r["item_id"],"order_id":r["stripe_session"],
+                "amount_brl":r["amount_brl"],"created_at":r["created_at"]} for r in rows]
+            self._ok({"ok":True,"pending":pending}); return
+
+        # ── Admin: confirmar PIX ───────────────────────────────────────────────
+        if p == "/api/admin/store/confirm":
+            if not _check_admin(b): self._err("forbidden",403); return
+            pid = b.get("id")
+            if not pid: self._err("id required"); return
+            with _db_lock:
+                con = _db(); now = time.time()
+                row = con.execute("SELECT * FROM purchases WHERE id=?",(pid,)).fetchone()
+                if not row: con.close(); self._err("Pedido não encontrado"); return
+                con.execute("UPDATE purchases SET status='paid',paid_at=? WHERE id=?",(now,pid))
+                con.commit(); con.close()
+            print(f"[PIX] ✓ Confirmado #{pid} — {row['gmbr_id']} → {row['item_id']}")
+            self._ok({"ok":True,"gmbr_id":row["gmbr_id"],"item_id":row["item_id"]}); return
+
+        # ── Admin: rejeitar pedido ─────────────────────────────────────────────
+        if p == "/api/admin/store/reject":
+            if not _check_admin(b): self._err("forbidden",403); return
+            pid = b.get("id")
+            if not pid: self._err("id required"); return
+            with _db_lock:
+                con = _db()
+                con.execute("DELETE FROM purchases WHERE id=? AND status='pending'",(pid,))
+                con.commit(); con.close()
+            self._ok({"ok":True}); return
+
+        # ── Admin: salvar chave PIX ────────────────────────────────────────────
+        if p == "/api/admin/store/pix-config":
+            if not _check_admin(b): self._err("forbidden",403); return
+            with _db_lock:
+                con = _db()
+                for k in ["pix_key","pix_key_type","pix_name"]:
+                    con.execute("INSERT INTO pix_config (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                (k, b.get(k,"").strip()))
+                con.commit(); con.close()
+            self._ok({"ok":True}); return
+
+        # ── Admin: ler chave PIX ───────────────────────────────────────────────
+        if p == "/api/admin/store/pix-config-get":
+            if not _check_admin(b): self._err("forbidden",403); return
+            with _db_lock:
+                con = _db()
+                rows = con.execute("SELECT key,value FROM pix_config").fetchall()
+                con.close()
+            cfg = {r["key"]:r["value"] for r in rows}
+            self._ok({"ok":True,
+                "pix_key":cfg.get("pix_key",PIX_KEY),
+                "pix_key_type":cfg.get("pix_key_type",PIX_KEY_TYPE),
+                "pix_name":cfg.get("pix_name",PIX_NAME)}); return
+
+        # ── Admin: CRUD itens da loja ──────────────────────────────────────────
+        if p == "/api/admin/store/items":
+            if not _check_admin(b): self._err("forbidden",403); return
+            with _db_lock:
+                con = _db()
+                rows = con.execute("SELECT * FROM store_items ORDER BY sort_order,id").fetchall()
+                con.close()
+            items = [{"id":r["id"],"type":r["type"],"label":r["label"],"icon":r["icon"],
+                "price_brl":r["price_brl"],"preview":r["preview"],
+                "includes":json.loads(r["includes"] or "[]"),
+                "sort_order":r["sort_order"],"active":bool(r["active"])} for r in rows]
+            self._ok({"ok":True,"items":items}); return
+
+        if p in ("/api/admin/store/save", "/api/admin/store/create"):
+            if not _check_admin(b): self._err("forbidden",403); return
+            iid   = b.get("id","").strip().lower().replace(" ","_")
+            label = b.get("label","").strip()[:80]
+            if not iid or not label: self._err("id e label obrigatórios"); return
+            price = int(b.get("price_brl",490))
+            if price < 100: self._err("price_brl mínimo 100"); return
+            with _db_lock:
+                con = _db()
+                con.execute("""INSERT INTO store_items (id,type,label,icon,price_brl,preview,includes,sort_order,active)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET type=excluded.type,label=excluded.label,
+                    icon=excluded.icon,price_brl=excluded.price_brl,preview=excluded.preview,
+                    includes=excluded.includes,sort_order=excluded.sort_order,active=excluded.active""",
+                    (iid,b.get("type","banner"),label,b.get("icon","🎁"),price,
+                     b.get("preview","")[:200],json.dumps(b.get("includes",[])),
+                     int(b.get("sort_order",99)),1 if b.get("active",True) else 0))
+                con.commit(); con.close()
+            self._ok({"ok":True,"id":iid}); return
+
+        if p == "/api/admin/store/delete":
+            if not _check_admin(b): self._err("forbidden",403); return
+            iid = b.get("id","").strip()
+            if not iid: self._err("id required"); return
+            with _db_lock:
+                con = _db()
+                con.execute("UPDATE store_items SET active=0 WHERE id=?",(iid,))
+                con.commit(); con.close()
+            self._ok({"ok":True}); return
+
+        if p == "/api/admin/store/reorder":
+            if not _check_admin(b): self._err("forbidden",403); return
+            with _db_lock:
+                con = _db()
+                for i,iid in enumerate(b.get("order",[])):
+                    con.execute("UPDATE store_items SET sort_order=? WHERE id=?",(i,iid))
+                con.commit(); con.close()
+            self._ok({"ok":True}); return
+
 
         # ── Premium: check session status (polling from launcher) ──────────────
         if p == "/api/premium/check-session":
@@ -873,74 +923,6 @@ class Handler(BaseHTTPRequestHandler):
             if not row:
                 self._ok({"ok": True, "status": "not_found"}); return
             self._ok({"ok": True, "status": row["status"], "item_id": row["item_id"]}); return
-
-        # ── Admin: listar todos os itens da loja (incluindo inativos) ────────
-        if p == "/api/admin/store/items":
-            if not _check_admin(b): self._err("forbidden", 403); return
-            with _db_lock:
-                con = _db()
-                rows = con.execute("SELECT * FROM store_items ORDER BY sort_order ASC, id ASC").fetchall()
-                con.close()
-            items = []
-            for r in rows:
-                items.append({
-                    "id": r["id"], "type": r["type"], "label": r["label"],
-                    "icon": r["icon"], "price_brl": r["price_brl"],
-                    "preview": r["preview"], "includes": json.loads(r["includes"] or "[]"),
-                    "sort_order": r["sort_order"], "active": bool(r["active"]),
-                })
-            self._ok({"ok": True, "items": items}); return
-
-        # ── Admin: criar / editar item ─────────────────────────────────────────
-        if p in ("/api/admin/store/save", "/api/admin/store/create"):
-            if not _check_admin(b): self._err("forbidden", 403); return
-            item_id   = b.get("id","").strip().lower().replace(" ","_")
-            item_type = b.get("type","banner").strip()
-            label     = b.get("label","").strip()[:80]
-            icon      = b.get("icon","🎁").strip()[:10]
-            price_brl = int(b.get("price_brl", 490))
-            preview   = b.get("preview","").strip()[:200]
-            includes  = json.dumps(b.get("includes", []))
-            sort_order= int(b.get("sort_order", 99))
-            active    = 1 if b.get("active", True) else 0
-            if not item_id: self._err("id required"); return
-            if not label:   self._err("label required"); return
-            if price_brl <= 0: self._err("price_brl deve ser > 0"); return
-            with _db_lock:
-                con = _db()
-                con.execute("""INSERT INTO store_items (id,type,label,icon,price_brl,preview,includes,sort_order,active)
-                    VALUES (?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        type=excluded.type, label=excluded.label, icon=excluded.icon,
-                        price_brl=excluded.price_brl, preview=excluded.preview,
-                        includes=excluded.includes, sort_order=excluded.sort_order,
-                        active=excluded.active
-                """, (item_id, item_type, label, icon, price_brl, preview, includes, sort_order, active))
-                con.commit(); con.close()
-            self._ok({"ok": True, "id": item_id}); return
-
-        # ── Admin: deletar item ────────────────────────────────────────────────
-        if p == "/api/admin/store/delete":
-            if not _check_admin(b): self._err("forbidden", 403); return
-            item_id = b.get("id","").strip()
-            if not item_id: self._err("id required"); return
-            with _db_lock:
-                con = _db()
-                # Soft delete — marca como inativo
-                con.execute("UPDATE store_items SET active=0 WHERE id=?", (item_id,))
-                con.commit(); con.close()
-            self._ok({"ok": True}); return
-
-        # ── Admin: reordenar itens ─────────────────────────────────────────────
-        if p == "/api/admin/store/reorder":
-            if not _check_admin(b): self._err("forbidden", 403); return
-            order = b.get("order", [])  # lista de ids na nova ordem
-            with _db_lock:
-                con = _db()
-                for i, item_id in enumerate(order):
-                    con.execute("UPDATE store_items SET sort_order=? WHERE id=?", (i, item_id))
-                con.commit(); con.close()
-            self._ok({"ok": True}); return
 
         self._err("Not found", 404)
 
