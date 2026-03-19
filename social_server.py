@@ -52,6 +52,40 @@ PREMIUM_ITEMS = [
    "includes":["banner_deep_void","banner_thunder","av_diamond","av_phoenix","av_shadow"]},
 ]
 _ITEMS_BY_ID = {it["id"]: it for it in PREMIUM_ITEMS}
+
+def _get_store_items(con=None):
+    """Carrega itens da loja do banco. Retorna lista ordenada."""
+    close = False
+    if con is None:
+        con = _db(); close = True
+    rows = con.execute("SELECT * FROM store_items WHERE active=1 ORDER BY sort_order ASC, id ASC").fetchall()
+    if close: con.close()
+    items = []
+    for r in rows:
+        it = {
+            "id":        r["id"],
+            "type":      r["type"],
+            "label":     r["label"],
+            "icon":      r["icon"],
+            "price_brl": r["price_brl"],
+            "preview":   r["preview"],
+            "includes":  json.loads(r["includes"] or "[]"),
+        }
+        items.append(it)
+    return items
+
+def _get_item_by_id(item_id: str, con=None):
+    close = False
+    if con is None:
+        con = _db(); close = True
+    row = con.execute("SELECT * FROM store_items WHERE id=? AND active=1", (item_id,)).fetchone()
+    if close: con.close()
+    if not row: return None
+    return {
+        "id": row["id"], "type": row["type"], "label": row["label"],
+        "icon": row["icon"], "price_brl": row["price_brl"],
+        "preview": row["preview"], "includes": json.loads(row["includes"] or "[]"),
+    }
 # ─── DB ──────────────────────────────────────────────────────────────────────
 def _db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -114,6 +148,17 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_purchases_gmbr     ON purchases(gmbr_id);
         CREATE INDEX IF NOT EXISTS idx_purchases_session  ON purchases(stripe_session);
+        CREATE TABLE IF NOT EXISTS store_items (
+            id         TEXT PRIMARY KEY,
+            type       TEXT NOT NULL DEFAULT 'banner',
+            label      TEXT NOT NULL DEFAULT '',
+            icon       TEXT NOT NULL DEFAULT '🎁',
+            price_brl  INTEGER NOT NULL DEFAULT 490,
+            preview    TEXT NOT NULL DEFAULT '',
+            includes   TEXT NOT NULL DEFAULT '[]',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            active     INTEGER NOT NULL DEFAULT 1
+        );
         """)
         con.commit()
         con.close()
@@ -125,6 +170,24 @@ def init_db():
         con.commit(); con.close()
     except Exception as e:
         print(f"[DB] config init: {e}")
+    # Seed store_items a partir de PREMIUM_ITEMS se ainda estiver vazio
+    try:
+        con = _db()
+        count = con.execute("SELECT COUNT(*) FROM store_items").fetchone()[0]
+        if count == 0:
+            for i, it in enumerate(PREMIUM_ITEMS):
+                con.execute("""INSERT OR IGNORE INTO store_items
+                    (id,type,label,icon,price_brl,preview,includes,sort_order,active)
+                    VALUES (?,?,?,?,?,?,?,?,1)""", (
+                    it["id"], it["type"], it["label"],
+                    it.get("icon","🎁"), it["price_brl"],
+                    it.get("preview",""), json.dumps(it.get("includes",[])), i
+                ))
+            con.commit()
+            print(f"[DB] Seeded {len(PREMIUM_ITEMS)} store items")
+        con.close()
+    except Exception as e:
+        print(f"[DB] store_items seed: {e}")
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 def _check_sig(gmbr_id: str, sig: str) -> bool:
@@ -374,21 +437,22 @@ class Handler(BaseHTTPRequestHandler):
             gid = q.get("gmbr_id","").upper()
             sig = q.get("sig","")
             owned = []
-            if gid and _check_sig(gid, sig):
-                with _db_lock:
-                    con = _db(); cur = con.cursor()
+            with _db_lock:
+                con = _db(); cur = con.cursor()
+                if gid and _check_sig(gid, sig):
                     rows = cur.execute(
                         "SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'", (gid,)).fetchall()
-                    con.close()
-                owned = [r["item_id"] for r in rows]
+                    owned = [r["item_id"] for r in rows]
+                items_db = _get_store_items(con)
+                con.close()
             # Expand bundle ownership
             owned_set = set(owned)
             for iid in list(owned_set):
-                it = _ITEMS_BY_ID.get(iid,{})
+                it = next((x for x in items_db if x["id"]==iid), {})
                 if it.get("type") == "bundle":
                     owned_set.update(it.get("includes",[]))
             items_out = []
-            for it in PREMIUM_ITEMS:
+            for it in items_db:
                 entry = dict(it)
                 entry["owned"] = it["id"] in owned_set
                 items_out.append(entry)
@@ -412,6 +476,23 @@ class Handler(BaseHTTPRequestHandler):
                 if it.get("type") == "bundle":
                     owned.update(it.get("includes",[]))
             self._ok({"ok": True, "owned": list(owned)}); return
+
+        # ── Admin: listar itens (GET) ─────────────────────────────────────────
+        if p == "/api/admin/store/items":
+            if not _check_admin(q): self._err("forbidden", 403); return
+            with _db_lock:
+                con = _db()
+                rows = con.execute("SELECT * FROM store_items ORDER BY sort_order ASC, id ASC").fetchall()
+                con.close()
+            items = []
+            for r in rows:
+                items.append({
+                    "id": r["id"], "type": r["type"], "label": r["label"],
+                    "icon": r["icon"], "price_brl": r["price_brl"],
+                    "preview": r["preview"], "includes": json.loads(r["includes"] or "[]"),
+                    "sort_order": r["sort_order"], "active": bool(r["active"]),
+                })
+            self._ok({"ok": True, "items": items}); return
 
         self._err("Not found", 404)
 
@@ -680,7 +761,7 @@ class Handler(BaseHTTPRequestHandler):
             if not item_id: self._err("item_id required"); return
             if not ABACATE_TOKEN: self._err("Pagamentos não configurados — defina ABACATE_TOKEN no Railway"); return
 
-            item = _ITEMS_BY_ID.get(item_id)
+            item = _get_item_by_id(item_id)
             if not item: self._err(f"Item '{item_id}' não existe"); return
 
             amount_brl  = round(item["price_brl"] / 100, 2)  # centavos → reais
@@ -792,6 +873,74 @@ class Handler(BaseHTTPRequestHandler):
             if not row:
                 self._ok({"ok": True, "status": "not_found"}); return
             self._ok({"ok": True, "status": row["status"], "item_id": row["item_id"]}); return
+
+        # ── Admin: listar todos os itens da loja (incluindo inativos) ────────
+        if p == "/api/admin/store/items":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            with _db_lock:
+                con = _db()
+                rows = con.execute("SELECT * FROM store_items ORDER BY sort_order ASC, id ASC").fetchall()
+                con.close()
+            items = []
+            for r in rows:
+                items.append({
+                    "id": r["id"], "type": r["type"], "label": r["label"],
+                    "icon": r["icon"], "price_brl": r["price_brl"],
+                    "preview": r["preview"], "includes": json.loads(r["includes"] or "[]"),
+                    "sort_order": r["sort_order"], "active": bool(r["active"]),
+                })
+            self._ok({"ok": True, "items": items}); return
+
+        # ── Admin: criar / editar item ─────────────────────────────────────────
+        if p in ("/api/admin/store/save", "/api/admin/store/create"):
+            if not _check_admin(b): self._err("forbidden", 403); return
+            item_id   = b.get("id","").strip().lower().replace(" ","_")
+            item_type = b.get("type","banner").strip()
+            label     = b.get("label","").strip()[:80]
+            icon      = b.get("icon","🎁").strip()[:10]
+            price_brl = int(b.get("price_brl", 490))
+            preview   = b.get("preview","").strip()[:200]
+            includes  = json.dumps(b.get("includes", []))
+            sort_order= int(b.get("sort_order", 99))
+            active    = 1 if b.get("active", True) else 0
+            if not item_id: self._err("id required"); return
+            if not label:   self._err("label required"); return
+            if price_brl <= 0: self._err("price_brl deve ser > 0"); return
+            with _db_lock:
+                con = _db()
+                con.execute("""INSERT INTO store_items (id,type,label,icon,price_brl,preview,includes,sort_order,active)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        type=excluded.type, label=excluded.label, icon=excluded.icon,
+                        price_brl=excluded.price_brl, preview=excluded.preview,
+                        includes=excluded.includes, sort_order=excluded.sort_order,
+                        active=excluded.active
+                """, (item_id, item_type, label, icon, price_brl, preview, includes, sort_order, active))
+                con.commit(); con.close()
+            self._ok({"ok": True, "id": item_id}); return
+
+        # ── Admin: deletar item ────────────────────────────────────────────────
+        if p == "/api/admin/store/delete":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            item_id = b.get("id","").strip()
+            if not item_id: self._err("id required"); return
+            with _db_lock:
+                con = _db()
+                # Soft delete — marca como inativo
+                con.execute("UPDATE store_items SET active=0 WHERE id=?", (item_id,))
+                con.commit(); con.close()
+            self._ok({"ok": True}); return
+
+        # ── Admin: reordenar itens ─────────────────────────────────────────────
+        if p == "/api/admin/store/reorder":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            order = b.get("order", [])  # lista de ids na nova ordem
+            with _db_lock:
+                con = _db()
+                for i, item_id in enumerate(order):
+                    con.execute("UPDATE store_items SET sort_order=? WHERE id=?", (i, item_id))
+                con.commit(); con.close()
+            self._ok({"ok": True}); return
 
         self._err("Not found", 404)
 
