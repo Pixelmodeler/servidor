@@ -1,0 +1,104 @@
+# GMBR Social Server — Deploy Railway (Passo a Passo)
+
+## Arquivos para subir (pasta deploy/)
+- social_server.py   → o servidor
+- railway.json       → config de deploy
+- Procfile           → comando de start
+- runtime.txt        → versão Python
+- requirements.txt   → dependências (nenhuma)
+
+---
+
+## PARTE 1 — Subir o servidor no Railway
+
+### 1. Criar conta
+- Acesse: https://railway.app
+- Clique em "Start a New Project" → faça login com GitHub
+
+### 2. Criar repositório no GitHub
+- Acesse: https://github.com/new
+- Nome: gmbr-social (pode ser privado)
+- Clique em "Create repository"
+- Suba os 5 arquivos da pasta deploy/ para esse repositório
+
+  Se não sabe usar Git, usa o jeito mais fácil:
+  - Clica em "uploading an existing file" na página do repo criado
+  - Arrasta os 5 arquivos e clica em "Commit changes"
+
+### 3. Deploy no Railway
+- No Railway: New Project → Deploy from GitHub repo
+- Seleciona o repositório "gmbr-social"
+- Railway vai detectar o Procfile e fazer o deploy automaticamente
+
+### 4. Adicionar Volume (banco de dados persistente)
+- No projeto Railway, clica no serviço criado
+- Aba "Volumes" → "Add Volume"
+  - Mount Path: /data
+  - Size: 1 GB (gratuito)
+- Clica em "Add"
+
+### 5. Configurar variáveis de ambiente
+- Aba "Variables" → "New Variable"
+- Adiciona:
+  - Nome: SECRET_KEY
+  - Valor: (escolhe uma senha forte, ex: gmbr2025xSecreta!)
+- Salva
+
+### 6. Pegar a URL do servidor
+- Aba "Settings" → "Networking" → "Generate Domain"
+- Vai aparecer algo como: https://gmbr-social-production.up.railway.app
+- COPIA ESSA URL
+
+---
+
+## PARTE 2 — Configurar o Launcher
+
+### 7. Editar gmbr_settings.json
+- Encontra o arquivo gmbr_settings.json na pasta de dados do launcher
+  (normalmente em: %APPDATA%\GMBR\ ou na mesma pasta do app.py)
+- Adiciona ou edita essas duas linhas:
+
+```json
+{
+  "social_server_url": "https://SUA-URL-AQUI.railway.app",
+  "social_secret_key": "gmbr2025xSecreta!"
+}
+```
+
+IMPORTANTE: o valor de social_secret_key tem que ser EXATAMENTE igual ao
+SECRET_KEY que você colocou no Railway na etapa 5.
+
+### 8. Reiniciar o launcher
+- Fecha e abre o launcher
+- Vai em configurações → social
+- Se aparecer "online" o servidor está conectado
+
+---
+
+## PARTE 3 — Verificar que está funcionando
+
+### Teste rápido
+- Abre no navegador: https://SUA-URL.railway.app/api/ping
+- Deve retornar: {"ok": true, "ts": 1234567890}
+- Se retornar isso, o servidor está online e funcionando
+
+---
+
+## Observações importantes
+
+- O Railway tem 500 horas gratuitas por mês no free tier
+  Para um único serviço rodando 24/7 (744h/mês) você precisa do plano Hobby ($5/mês)
+  OU cria uma conta nova todo mês (não recomendado)
+  OU usa Oracle Cloud Always Free (grátis para sempre, mas mais difícil de configurar)
+
+- O banco de dados (SQLite) fica no Volume /data/social.db
+  Nunca vai perder os dados mesmo que o servidor reinicie
+
+- O servidor aguenta milhares de usuários simultâneos tranquilamente
+  SQLite com WAL mode é mais que suficiente para um launcher de jogos
+
+- Se quiser trocar a senha secreta depois:
+  1. Muda SECRET_KEY no Railway (Variables)
+  2. Muda social_secret_key no gmbr_settings.json
+  3. Reinicia o launcher
+  Os dados não são apagados, só a autenticação muda
