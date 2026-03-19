@@ -274,6 +274,32 @@ class Handler(BaseHTTPRequestHandler):
             self._ok({"ok": True,
                       "online": [_fmt_user(r) for r in rows if r["gmbr_id"]!=gid]}); return
 
+        # ── My punishment status ──────────────────────────────────────────────
+        if p == "/api/my-status":
+            gid = q.get("gmbr_id","").upper()
+            sig = q.get("sig","")
+            if not gid or not _check_sig(gid, sig):
+                self._err("auth", 401); return
+            now = time.time()
+            with _db_lock:
+                con = _db(); cur = con.cursor()
+                ban = cur.execute(
+                    "SELECT * FROM punishments WHERE gmbr_id=? AND type='ban' AND (expires_at=0 OR expires_at>?)",
+                    (gid, now)).fetchone()
+                mute = cur.execute(
+                    "SELECT * FROM punishments WHERE gmbr_id=? AND type='mute' AND (expires_at=0 OR expires_at>?)",
+                    (gid, now)).fetchone()
+                con.close()
+            self._ok({
+                "ok": True,
+                "banned": bool(ban),
+                "ban_reason":   ban["reason"]   if ban  else "",
+                "ban_expires":  ban["expires_at"]  if ban  else 0,
+                "muted":  bool(mute),
+                "mute_reason":  mute["reason"]  if mute else "",
+                "mute_expires": mute["expires_at"] if mute else 0,
+            }); return
+
         # ── Admin: list all users ─────────────────────────────────────────────
         if p == "/api/admin/users":
             if not _check_admin(q): self._err("forbidden", 403); return
