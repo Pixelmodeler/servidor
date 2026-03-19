@@ -79,7 +79,7 @@ def _get_store_items(con=None):
     close = False
     if con is None: con = _db(); close = True
     rows = con.execute("SELECT * FROM store_items WHERE active=1 ORDER BY sort_order,id").fetchall()
-    if close: con.close()
+    if close: pass
     return [{"id":r["id"],"type":r["type"],"label":r["label"],"icon":r["icon"],
              "price_brl":r["price_brl"],"preview":r["preview"],
              "includes":json.loads(r["includes"] or "[]")} for r in rows]
@@ -88,7 +88,7 @@ def _get_item_by_id(item_id, con=None):
     close = False
     if con is None: con = _db(); close = True
     row = con.execute("SELECT * FROM store_items WHERE id=? AND active=1",(item_id,)).fetchone()
-    if close: con.close()
+    if close: pass
     if not row: return None
     return {"id":row["id"],"type":row["type"],"label":row["label"],"icon":row["icon"],
             "price_brl":row["price_brl"],"preview":row["preview"],
@@ -110,10 +110,22 @@ def _pix_brcode(pix_key, pix_name, amount_brl, order_id):
             tlv(59,pix_name[:25]) + tlv(60,"SAO PAULO") +
             tlv(62,tlv(5,info)) + "6304")
     return base + f"{crc16(base):04X}"
-# ─── DB ──────────────────────────────────────────────────────────────────────
+# ─── DB com connection pool por thread ───────────────────────────────────────
+import threading as _threading
+_db_local = _threading.local()
+
 def _db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
+    """Retorna conexão SQLite reutilizável por thread (thread-local pool)."""
+    con = getattr(_db_local, 'con', None)
+    if con is None:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+        con.row_factory = sqlite3.Row
+        # WAL mode: leituras não bloqueiam escritas, escritas não bloqueiam leituras
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA cache_size=-8000")  # 8MB cache por conexão
+        con.execute("PRAGMA temp_store=MEMORY")
+        _db_local.con = con
     return con
 
 def init_db():
@@ -172,6 +184,12 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_purchases_gmbr     ON purchases(gmbr_id);
         CREATE INDEX IF NOT EXISTS idx_purchases_session  ON purchases(stripe_session);
+        CREATE INDEX IF NOT EXISTS idx_purchases_status   ON purchases(status);
+        CREATE INDEX IF NOT EXISTS idx_purchases_gmbr_status ON purchases(gmbr_id, status);
+        CREATE INDEX IF NOT EXISTS idx_friends_a ON friends(a, status);
+        CREATE INDEX IF NOT EXISTS idx_friends_b ON friends(b, status);
+        CREATE INDEX IF NOT EXISTS idx_users_gmbr ON users(gmbr_id);
+        CREATE INDEX IF NOT EXISTS idx_punishments_gmbr ON punishments(gmbr_id, type);
         CREATE TABLE IF NOT EXISTS pix_config (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
@@ -189,7 +207,13 @@ def init_db():
         );
         """)
         con.commit()
-        con.close()
+    # Ativa WAL na conexão principal
+    try:
+        c = sqlite3.connect(DB_PATH)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.close()
+    except: pass
     print(f"[DB] {DB_PATH}")
     # Seed store_items se vazio
     try:
@@ -206,7 +230,6 @@ def init_db():
                 ))
             con.commit()
             print(f"[DB] Seeded {len(PREMIUM_ITEMS)} store items")
-        con.close()
     except Exception as e:
         print(f"[DB] store_items seed: {e}")
 
@@ -335,7 +358,6 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db(); cur = con.cursor()
                 row = _user(cur, gid)
-                con.close()
             if not row: self._err("Usuário não encontrado", 404); return
             self._ok({"ok": True, "user": _fmt_user(row)}); return
 
@@ -359,7 +381,6 @@ class Handler(BaseHTTPRequestHandler):
                     "pending_recv": [_fu(g) for g in precvs],
                     "pending_sent": [_fu(g) for g in psents],
                 }
-                con.close()
             self._ok(result); return
 
         # ── DM history ────────────────────────────────────────────────────────
@@ -383,7 +404,6 @@ class Handler(BaseHTTPRequestHandler):
                 rows = cur.execute(
                     "SELECT * FROM messages WHERE conv_id=? AND ts>? ORDER BY ts ASC LIMIT ?",
                     (conv, since, MSG_LIMIT)).fetchall()
-                con.close()
             msgs = [{"id": r["id"], "from": r["from_id"], "from_name": r["from_name"],
                      "text": r["text"], "ts": r["ts"]} for r in rows]
             self._ok({"ok": True, "messages": msgs}); return
@@ -399,7 +419,6 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db(); cur = con.cursor()
                 rows = cur.execute(
                     "SELECT * FROM users WHERE last_seen>?", (cutoff,)).fetchall()
-                con.close()
             self._ok({"ok": True,
                       "online": [_fmt_user(r) for r in rows if r["gmbr_id"]!=gid]}); return
 
@@ -418,7 +437,6 @@ class Handler(BaseHTTPRequestHandler):
                 mute = cur.execute(
                     "SELECT * FROM punishments WHERE gmbr_id=? AND type='mute' AND (expires_at=0 OR expires_at>?)",
                     (gid, now)).fetchone()
-                con.close()
             self._ok({
                 "ok": True,
                 "banned": bool(ban),
@@ -438,7 +456,6 @@ class Handler(BaseHTTPRequestHandler):
                 rows = cur.execute("SELECT * FROM users ORDER BY last_seen DESC").fetchall()
                 puns = cur.execute("SELECT * FROM punishments WHERE expires_at=0 OR expires_at>?",
                                    (time.time(),)).fetchall()
-                con.close()
             pun_map = {}
             for pun in puns:
                 pun_map.setdefault(pun["gmbr_id"], []).append({
@@ -464,7 +481,6 @@ class Handler(BaseHTTPRequestHandler):
                     rows = cur.execute("SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'",(gid,)).fetchall()
                     owned = [r["item_id"] for r in rows]
                 items_db = _get_store_items(con)
-                con.close()
             owned_set = set(owned)
             for iid in list(owned_set):
                 it = next((x for x in items_db if x["id"]==iid),{})
@@ -482,7 +498,6 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db(); cur = con.cursor()
                 rows = cur.execute(
                     "SELECT item_id FROM purchases WHERE gmbr_id=? AND status='paid'", (gid,)).fetchall()
-                con.close()
             owned = set(r["item_id"] for r in rows)
             # Expand bundles
             for iid in list(owned):
@@ -531,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
                     b.get("avatar_effect","none")[:50],
                     created, now,
                 ))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Heartbeat ──────────────────────────────────────────────────────────
@@ -542,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db()
                 con.execute("UPDATE users SET last_seen=? WHERE gmbr_id=?",
                             (time.time(), gid))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Friend request ─────────────────────────────────────────────────────
@@ -568,13 +583,12 @@ class Handler(BaseHTTPRequestHandler):
                     # They already sent us a request → auto-accept
                     cur.execute("UPDATE friends SET status='accepted' WHERE a=? AND b=?",
                                 (target, gid))
-                    con.commit(); con.close()
+                    con.commit();
                     self._ok({"ok": True, "auto_accepted": True}); return
                 cur.execute("INSERT INTO friends (a,b,status,ts) VALUES (?,?,'pending',?)",
                             (gid, target, time.time()))
                 con.commit()
                 tu = _user(cur, target)
-                con.close()
             name = (tu["display_name"] or tu["name"]) if tu else target
             self._ok({"ok": True, "name": name}); return
 
@@ -595,7 +609,6 @@ class Handler(BaseHTTPRequestHandler):
                             (sender, gid))
                 con.commit()
                 su = _user(cur, sender)
-                con.close()
             name = (su["display_name"] or su["name"]) if su else sender
             self._ok({"ok": True, "name": name}); return
 
@@ -608,7 +621,7 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db()
                 con.execute("DELETE FROM friends WHERE a=? AND b=? AND status='pending'",
                             (sender, gid))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Remove friend ──────────────────────────────────────────────────────
@@ -621,7 +634,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute(
                     "DELETE FROM friends WHERE (a=? AND b=?) OR (a=? AND b=?)",
                     (gid, other, other, gid))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Send DM ────────────────────────────────────────────────────────────
@@ -649,7 +662,6 @@ class Handler(BaseHTTPRequestHandler):
                 rows = cur.execute(
                     "SELECT * FROM messages WHERE conv_id=? ORDER BY ts ASC LIMIT ?",
                     (conv, MSG_LIMIT)).fetchall()
-                con.close()
             msgs = [{"id": r["id"], "from": r["from_id"], "from_name": r["from_name"],
                      "text": r["text"], "ts": r["ts"]} for r in rows]
             self._ok({"ok": True, "messages": msgs}); return
@@ -670,7 +682,7 @@ class Handler(BaseHTTPRequestHandler):
                     ON CONFLICT(gmbr_id,type) DO UPDATE SET
                         reason=excluded.reason, expires_at=excluded.expires_at, created_at=excluded.created_at
                 """, (gid, "ban", reason, expires, time.time()))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True, "gmbr_id": gid, "expires_at": expires}); return
 
         # ── Admin: mute user ───────────────────────────────────────────────────
@@ -689,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
                     ON CONFLICT(gmbr_id,type) DO UPDATE SET
                         reason=excluded.reason, expires_at=excluded.expires_at, created_at=excluded.created_at
                 """, (gid, "mute", reason, expires, time.time()))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True, "gmbr_id": gid, "expires_at": expires}); return
 
         # ── Admin: unban/unmute user ───────────────────────────────────────────
@@ -704,7 +716,7 @@ class Handler(BaseHTTPRequestHandler):
                     con.execute("DELETE FROM punishments WHERE gmbr_id=?", (gid,))
                 else:
                     con.execute("DELETE FROM punishments WHERE gmbr_id=? AND type=?", (gid, ptype))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Admin: kick (force offline) ────────────────────────────────────────
@@ -715,7 +727,7 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db()
                 con.execute("UPDATE users SET last_seen=0 WHERE gmbr_id=?", (gid,))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Admin: grant item manually (sem pagamento) ─────────────────────────
@@ -731,7 +743,7 @@ class Handler(BaseHTTPRequestHandler):
                     VALUES (?,?,'admin','paid',0,?,?)
                     ON CONFLICT(gmbr_id,item_id) DO UPDATE SET status='paid', paid_at=excluded.paid_at
                 """, (gid, item_id, now, now))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True, "granted": item_id, "to": gid}); return
 
         # ── Admin: revoke item ─────────────────────────────────────────────────
@@ -742,7 +754,7 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db()
                 con.execute("DELETE FROM purchases WHERE gmbr_id=? AND item_id=?", (gid, item_id))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok": True}); return
 
         # ── Admin: update price_ids in catalog ─────────────────────────────────
@@ -755,7 +767,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)""")
                 con.execute("INSERT INTO config (key,value) VALUES ('price_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             (json.dumps(price_ids),))
-                con.commit(); con.close()
+                con.commit();
             # Update in-memory catalog
             for item_id, price_id in price_ids.items():
                 if item_id in _ITEMS_BY_ID:
@@ -777,7 +789,6 @@ class Handler(BaseHTTPRequestHandler):
                     return r["value"] if r else ""
                 pix_key  = _cfg("pix_key")  or PIX_KEY
                 pix_name = _cfg("pix_name") or PIX_NAME
-                con.close()
             if not pix_key: self._err("PIX não configurado. Configure no Painel Admin → Loja."); return
             amount_brl = round(item["price_brl"]/100, 2)
             label      = item.get("label", item_id)
@@ -802,7 +813,7 @@ class Handler(BaseHTTPRequestHandler):
                     ON CONFLICT(gmbr_id,item_id) DO UPDATE SET
                         stripe_session=excluded.stripe_session,status='pending',created_at=excluded.created_at
                 """, (gid, item_id, order_id, item["price_brl"], now))
-                con.commit(); con.close()
+                con.commit();
             print(f"[PIX] Pedido {order_id} — {gid} → {item_id} R${amount_brl:.2f}")
             self._ok({"ok":True,"session_id":order_id,"pix_copy":pix_copy,"pix_qr":pix_qr_b64,
                       "pix_key":pix_key,"pix_name":pix_name,"amount":amount_brl,
@@ -820,7 +831,6 @@ class Handler(BaseHTTPRequestHandler):
                 rows = cur.execute("""SELECT p.*,u.display_name,u.name as uname FROM purchases p
                     LEFT JOIN users u ON u.gmbr_id=p.gmbr_id
                     WHERE p.status='pending' ORDER BY p.created_at DESC LIMIT 100""").fetchall()
-                con.close()
             pending = [{"id":r["id"],"gmbr_id":r["gmbr_id"],
                 "name":r["display_name"] or r["uname"] or r["gmbr_id"],
                 "item_id":r["item_id"],"order_id":r["stripe_session"],
@@ -837,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
                 row = con.execute("SELECT * FROM purchases WHERE id=?",(pid,)).fetchone()
                 if not row: con.close(); self._err("Pedido não encontrado"); return
                 con.execute("UPDATE purchases SET status='paid',paid_at=? WHERE id=?",(now,pid))
-                con.commit(); con.close()
+                con.commit();
             print(f"[PIX] ✓ Confirmado #{pid} — {row['gmbr_id']} → {row['item_id']}")
             self._ok({"ok":True,"gmbr_id":row["gmbr_id"],"item_id":row["item_id"]}); return
 
@@ -849,7 +859,7 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db()
                 con.execute("DELETE FROM purchases WHERE id=? AND status='pending'",(pid,))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok":True}); return
 
         # ── Admin: salvar chave PIX ────────────────────────────────────────────
@@ -860,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
                 for k in ["pix_key","pix_key_type","pix_name"]:
                     con.execute("INSERT INTO pix_config (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                                 (k, b.get(k,"").strip()))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok":True}); return
 
         # ── Admin: ler chave PIX ───────────────────────────────────────────────
@@ -869,7 +879,6 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db()
                 rows = con.execute("SELECT key,value FROM pix_config").fetchall()
-                con.close()
             cfg = {r["key"]:r["value"] for r in rows}
             self._ok({"ok":True,
                 "pix_key":cfg.get("pix_key",PIX_KEY),
@@ -882,7 +891,6 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db()
                 rows = con.execute("SELECT * FROM store_items ORDER BY sort_order,id").fetchall()
-                con.close()
             items = [{"id":r["id"],"type":r["type"],"label":r["label"],"icon":r["icon"],
                 "price_brl":r["price_brl"],"preview":r["preview"],
                 "includes":json.loads(r["includes"] or "[]"),
@@ -906,7 +914,7 @@ class Handler(BaseHTTPRequestHandler):
                     (iid,b.get("type","banner"),label,b.get("icon","🎁"),price,
                      b.get("preview","")[:200],json.dumps(b.get("includes",[])),
                      int(b.get("sort_order",99)),1 if b.get("active",True) else 0))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok":True,"id":iid}); return
 
         if p == "/api/admin/store/delete":
@@ -916,7 +924,7 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 con = _db()
                 con.execute("UPDATE store_items SET active=0 WHERE id=?",(iid,))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok":True}); return
 
         if p == "/api/admin/store/reorder":
@@ -925,7 +933,7 @@ class Handler(BaseHTTPRequestHandler):
                 con = _db()
                 for i,iid in enumerate(b.get("order",[])):
                     con.execute("UPDATE store_items SET sort_order=? WHERE id=?",(i,iid))
-                con.commit(); con.close()
+                con.commit();
             self._ok({"ok":True}); return
 
 
@@ -940,7 +948,6 @@ class Handler(BaseHTTPRequestHandler):
                 row = cur.execute(
                     "SELECT * FROM purchases WHERE stripe_session=? AND gmbr_id=?",
                     (session_id, gid)).fetchone()
-                con.close()
             if not row:
                 self._ok({"ok": True, "status": "not_found"}); return
             self._ok({"ok": True, "status": row["status"], "item_id": row["item_id"]}); return
