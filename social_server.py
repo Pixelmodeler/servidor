@@ -26,7 +26,7 @@ DB_PATH     = os.environ.get("DB_PATH",     os.path.join(
 ONLINE_TTL  = 90   # segundos até marcar offline
 MSG_LIMIT   = 200  # máximo de msgs por conversa retornadas
 _db_lock    = threading.Lock()
-
+ADMIN_KEY   = os.environ.get("ADMIN_KEY", SECRET_KEY + "-admin")
 # ─── DB ──────────────────────────────────────────────────────────────────────
 def _db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -68,6 +68,14 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, ts);
         CREATE INDEX IF NOT EXISTS idx_users_ls  ON users(last_seen);
+        CREATE TABLE IF NOT EXISTS punishments (
+            gmbr_id    TEXT NOT NULL,
+            type       TEXT NOT NULL,  -- 'ban' | 'mute'
+            reason     TEXT DEFAULT '',
+            expires_at REAL DEFAULT 0, -- 0 = permanente
+            created_at REAL DEFAULT 0,
+            PRIMARY KEY (gmbr_id, type)
+        );
         """)
         con.commit()
         con.close()
@@ -85,6 +93,23 @@ def _mk_sig(gmbr_id: str) -> str:
     return hmac.new(
         SECRET_KEY.encode(), gmbr_id.upper().encode(), hashlib.sha256
     ).hexdigest()
+
+def _check_admin(b: dict) -> bool:
+    return hmac.compare_digest(b.get("admin_key",""), ADMIN_KEY)
+
+def _is_banned(cur, gmbr_id: str) -> bool:
+    now = time.time()
+    row = cur.execute(
+        "SELECT 1 FROM punishments WHERE gmbr_id=? AND type='ban' AND (expires_at=0 OR expires_at>?)",
+        (gmbr_id.upper(), now)).fetchone()
+    return bool(row)
+
+def _is_muted(cur, gmbr_id: str) -> bool:
+    now = time.time()
+    row = cur.execute(
+        "SELECT 1 FROM punishments WHERE gmbr_id=? AND type='mute' AND (expires_at=0 OR expires_at>?)",
+        (gmbr_id.upper(), now)).fetchone()
+    return bool(row)
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def _conv(a: str, b: str) -> str:
@@ -249,6 +274,30 @@ class Handler(BaseHTTPRequestHandler):
             self._ok({"ok": True,
                       "online": [_fmt_user(r) for r in rows if r["gmbr_id"]!=gid]}); return
 
+        # ── Admin: list all users ─────────────────────────────────────────────
+        if p == "/api/admin/users":
+            if not _check_admin(q): self._err("forbidden", 403); return
+            cutoff = time.time() - ONLINE_TTL
+            with _db_lock:
+                con = _db(); cur = con.cursor()
+                rows = cur.execute("SELECT * FROM users ORDER BY last_seen DESC").fetchall()
+                puns = cur.execute("SELECT * FROM punishments WHERE expires_at=0 OR expires_at>?",
+                                   (time.time(),)).fetchall()
+                con.close()
+            pun_map = {}
+            for pun in puns:
+                pun_map.setdefault(pun["gmbr_id"], []).append({
+                    "type": pun["type"], "reason": pun["reason"],
+                    "expires_at": pun["expires_at"]
+                })
+            users_out = []
+            for r in rows:
+                u = dict(_fmt_user(r))
+                u["punishments"] = pun_map.get(r["gmbr_id"], [])
+                u["online"] = (time.time() - (r["last_seen"] or 0)) < ONLINE_TTL
+                users_out.append(u)
+            self._ok({"ok": True, "users": users_out}); return
+
         self._err("Not found", 404)
 
     def do_POST(self):
@@ -263,6 +312,8 @@ class Handler(BaseHTTPRequestHandler):
             now = time.time()
             with _db_lock:
                 con = _db(); cur = con.cursor()
+                if _is_banned(cur, gid):
+                    con.close(); self._err("Conta banida", 403); return
                 existing = _user(cur, gid)
                 created  = existing["created_at"] if existing else now
                 cur.execute("""
@@ -390,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
             conv = _conv(gid, other)
             with _db_lock:
                 con = _db(); cur = con.cursor()
+                if _is_muted(cur, gid):
+                    con.close(); self._err("Você está silenciado e não pode enviar mensagens", 403); return
                 fr = cur.execute(
                     "SELECT 1 FROM friends WHERE ((a=? AND b=?) OR (a=? AND b=?)) AND status='accepted'",
                     (gid, other, other, gid)).fetchone()
@@ -407,6 +460,70 @@ class Handler(BaseHTTPRequestHandler):
             msgs = [{"id": r["id"], "from": r["from_id"], "from_name": r["from_name"],
                      "text": r["text"], "ts": r["ts"]} for r in rows]
             self._ok({"ok": True, "messages": msgs}); return
+
+        # ── Admin: ban user ────────────────────────────────────────────────────
+        if p == "/api/admin/ban":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            gid      = b.get("gmbr_id","").strip().upper()
+            reason   = b.get("reason","")[:200]
+            duration = int(b.get("duration", 0))  # minutos, 0=permanente
+            if not gid: self._err("gmbr_id required"); return
+            expires  = (time.time() + duration * 60) if duration > 0 else 0
+            with _db_lock:
+                con = _db()
+                con.execute("""
+                    INSERT INTO punishments (gmbr_id,type,reason,expires_at,created_at)
+                    VALUES (?,?,?,?,?)
+                    ON CONFLICT(gmbr_id,type) DO UPDATE SET
+                        reason=excluded.reason, expires_at=excluded.expires_at, created_at=excluded.created_at
+                """, (gid, "ban", reason, expires, time.time()))
+                con.commit(); con.close()
+            self._ok({"ok": True, "gmbr_id": gid, "expires_at": expires}); return
+
+        # ── Admin: mute user ───────────────────────────────────────────────────
+        if p == "/api/admin/mute":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            gid      = b.get("gmbr_id","").strip().upper()
+            reason   = b.get("reason","")[:200]
+            duration = int(b.get("duration", 60))  # minutos, 0=permanente
+            if not gid: self._err("gmbr_id required"); return
+            expires  = (time.time() + duration * 60) if duration > 0 else 0
+            with _db_lock:
+                con = _db()
+                con.execute("""
+                    INSERT INTO punishments (gmbr_id,type,reason,expires_at,created_at)
+                    VALUES (?,?,?,?,?)
+                    ON CONFLICT(gmbr_id,type) DO UPDATE SET
+                        reason=excluded.reason, expires_at=excluded.expires_at, created_at=excluded.created_at
+                """, (gid, "mute", reason, expires, time.time()))
+                con.commit(); con.close()
+            self._ok({"ok": True, "gmbr_id": gid, "expires_at": expires}); return
+
+        # ── Admin: unban/unmute user ───────────────────────────────────────────
+        if p == "/api/admin/pardon":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            gid  = b.get("gmbr_id","").strip().upper()
+            ptype = b.get("type","ban")  # 'ban' | 'mute' | 'all'
+            if not gid: self._err("gmbr_id required"); return
+            with _db_lock:
+                con = _db()
+                if ptype == "all":
+                    con.execute("DELETE FROM punishments WHERE gmbr_id=?", (gid,))
+                else:
+                    con.execute("DELETE FROM punishments WHERE gmbr_id=? AND type=?", (gid, ptype))
+                con.commit(); con.close()
+            self._ok({"ok": True}); return
+
+        # ── Admin: kick (force offline) ────────────────────────────────────────
+        if p == "/api/admin/kick":
+            if not _check_admin(b): self._err("forbidden", 403); return
+            gid = b.get("gmbr_id","").strip().upper()
+            if not gid: self._err("gmbr_id required"); return
+            with _db_lock:
+                con = _db()
+                con.execute("UPDATE users SET last_seen=0 WHERE gmbr_id=?", (gid,))
+                con.commit(); con.close()
+            self._ok({"ok": True}); return
 
         self._err("Not found", 404)
 
